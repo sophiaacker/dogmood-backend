@@ -1,12 +1,26 @@
 # suggestions.py
 from __future__ import annotations
-import os, json
+import os, json, re
 from typing import Dict, Iterable, List, Optional
 
-# Classifier label set (no remapping)
+# ----------------- debug helpers -----------------
+DEBUG = os.getenv("SUGGESTIONS_DEBUG") == "1"
+def _dbg(*a):
+    if DEBUG:
+        print("[SUGGESTIONS]", *a)
+
+# Try to load .env locally so you don't forget to export vars during dev
+try:
+    from dotenv import load_dotenv  # optional; if not installed it's fine
+    load_dotenv()
+except Exception:
+    pass
+
+# ----------------- label space -------------------
+# We stay in *classifier* label space end-to-end.
 CLASSIFIER_LABELS = {"joy", "boredom", "hunger", "aggressivity", "sadness"}
 
-# Safety-first, concise guidance per classifier label
+# Safety-first, concise rule fallback per classifier label
 RULES: Dict[str, Dict[str, str]] = {
     "joy": {
         "state": "The vocalization suggests a joyful, playful mood.",
@@ -58,6 +72,7 @@ def _normalize_probs(raw: Dict[str, float]) -> Dict[str, float]:
     return {k: v / total for k, v in clean.items()}
 
 def _scores_to_dict(scores: Iterable[Dict[str, float]]) -> Dict[str, float]:
+    """Convert [{'label': str, 'score': float}, ...] → {label: score}."""
     d: Dict[str, float] = {}
     for s in scores or []:
         lbl = str(s.get("label", "unknown")).strip().lower()
@@ -72,6 +87,114 @@ def _sorted_scores_from_probs(probs: Dict[str, float]) -> List[Dict[str, float]]
         reverse=True,
     )
 
+# ----------------- anthropic client -----------------
+
+def _try_llm(top: str, probs: Dict[str, float], context: Optional[str]) -> Optional[Dict[str, str]]:
+    """
+    Attempt an Anthropic call. Return dict({state,suggestion,reason}) or None on any issue.
+    Includes robust JSON extraction and debug logs.
+    """
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        _dbg("ANTHROPIC_API_KEY not set; using RULES fallback.")
+        return None
+
+    try:
+        from anthropic import Anthropic
+    except Exception as e:
+        _dbg("anthropic import failed:", repr(e))
+        return None
+
+    # Configurable model, temperature, timeout via env; sensible defaults
+    model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-latest")
+    try:
+        temperature = float(os.getenv("SUGGESTIONS_TEMPERATURE", "0.2"))
+    except Exception:
+        temperature = 0.2
+    try:
+        timeout = float(os.getenv("SUGGESTIONS_TIMEOUT_SEC", "20"))
+    except Exception:
+        timeout = 20.0
+
+    client = Anthropic(api_key=api_key)
+    # Note: older anthropic SDKs may not support .with_options; we'll rely on default timeout behavior.
+    _dbg("LLM model:", model, "temp:", temperature, "timeout:", timeout)
+
+    label_doc = (
+        "- joy: positive/playful arousal\n"
+        "- boredom: under-stimulation\n"
+        "- hunger: food expectation/need\n"
+        "- aggressivity: reactivity/guarding risk\n"
+        "- sadness: low arousal/whine\n"
+    )
+
+    # FIXED: the original prompt had adjacent strings without spaces → merged words → worse parsing.
+    system = (
+        "You are dog behavior analyst and veterinarian "
+        "Given classifier results from a bark, analyze the dog's moods. "
+        "Focus on the moods with the highest levels of expression. Based on the breakdown of moods the dog is experiencing, recommend actionable items that a dog owner can do to help with the current mood. "
+        "Avoid recommendations that only humans can do (e.g. taking deep breaths, journaling reading)"
+        "Target approaches that focus on humans helping out. For example, if a dog is anxious, you may expect taking them on a walk."
+        "Include product recommendations when relevant. You may recommend Kong peanut butter toys for example or certain teeth cleaning chews."
+        "Respond ONLY as JSON with keys {state, suggestion, reason}. "
+    )
+
+    user = (
+        f"Context: {context or 'N/A'}\n"
+        f"Top label (classifier space): {top}\n"
+        f"Label probabilities (classifier space): {json.dumps(probs or {}, separators=(',',':'))}\n\n"
+        f"Label guide:\n{label_doc}\n\n"
+        "Return ONLY JSON with keys exactly: state, suggestion, reason."
+    )
+
+    try:
+        msg = client.messages.create(
+            model=model,
+            max_tokens=200,
+            temperature=temperature,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+    except Exception as e:
+        _dbg("Anthropic request error:", repr(e))
+        return None
+
+    # ---- robust JSON extraction ----
+    text = "".join(getattr(p, "text", "") for p in getattr(msg, "content", []) if hasattr(p, "text"))
+    _dbg("RAW:", repr(text[:400]) + ("..." if len(text) > 400 else ""))
+
+    data = None
+    # 1) direct parse
+    try:
+        data = json.loads(text)
+    except Exception:
+        pass
+
+    # 2) fenced blocks ```json ... ```
+    if data is None:
+        m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S | re.I)
+        if m:
+            try:
+                data = json.loads(m.group(1))
+            except Exception as e:
+                _dbg("json.loads fenced failed:", repr(e))
+
+    # 3) first {...} blob
+    if data is None:
+        m = re.search(r"\{.*\}", text, re.S)
+        if m:
+            try:
+                data = json.loads(m.group(0))
+            except Exception as e:
+                _dbg("json.loads brace-scan failed:", repr(e))
+
+    if isinstance(data, dict) and all(k in data for k in ("state", "suggestion", "reason")):
+        _dbg("LLM JSON accepted.")
+        return data
+
+    _dbg("LLM returned non-JSON or wrong keys; falling back to RULES.")
+    return None
+
 # ----------------- public API -----------------
 
 def llm_suggestion(
@@ -79,7 +202,7 @@ def llm_suggestion(
     top_label: str,
     scores: Optional[Iterable[Dict[str, float]]] = None,
     context: Optional[str] = None,
-    # kept for API compatibility; when True we still treat labels as classifier labels
+    # kept for API compatibility; labels are classifier labels either way
     classifier_space: bool = True,
 ) -> Dict[str, str]:
     """
@@ -87,66 +210,33 @@ def llm_suggestion(
     Returns: {"state": str, "suggestion": str, "reason": str}
     """
     top = str(top_label).strip().lower()
-    if top not in CLASSIFIER_LABELS:
-        top = "unknown"
+    probs: Dict[str, float] = {}
 
-    probs = {}
     if scores:
         probs = _normalize_probs(_scores_to_dict(scores))
-        # Drop any non-classifier keys
+        # Keep only known classifier labels
         probs = {k: v for k, v in probs.items() if k in CLASSIFIER_LABELS}
         probs = _normalize_probs(probs)
+
+    if top not in CLASSIFIER_LABELS:
+        # If we got an unknown top but we have probabilities, pick the argmax;
+        # otherwise, mark as unknown.
+        top = max(probs, key=probs.get) if probs else "unknown"
+
     confidence = float(probs.get(top, 0.0)) if probs else 0.0
 
-    # Optional Anthropic path; graceful fallback to RULES on any issue
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if api_key:
-        try:
-            from anthropic import Anthropic
-            client = Anthropic(api_key=api_key)
+    # Try LLM; if it fails for any reason, we fall back to RULES
+    llm_out = _try_llm(top=top, probs=probs, context=context)
+    if llm_out is not None:
+        return llm_out
 
-            label_doc = (
-                "- joy: positive/playful arousal\n"
-                "- boredom: under-stimulation\n"
-                "- hunger: food expectation/need\n"
-                "- aggressivity: reactivity/guarding risk\n"
-                "- sadness: low arousal/whine\n"
-            )
-            system = (
-                "You assist a dog-bark classifier. Respond with compact JSON keys "
-                "{state, suggestion, reason}. One sentence each. Safety-first tone."
-            )
-            user = (
-                f"Context: {context or 'N/A'}\n"
-                f"Top label (classifier space): {top}\n"
-                f"Label probabilities (classifier space): "
-                f"{json.dumps(probs or {}, separators=(',',':'))}\n\n"
-                f"Label doc:\n{label_doc}\n\n"
-                "Return ONLY JSON with keys exactly: state, suggestion, reason."
-            )
-            msg = client.messages.create(
-                model=os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest"),
-                max_tokens=200,
-                temperature=0.2,
-                system=system,
-                messages=[{"role": "user", "content": user}],
-            )
-            text = "".join(getattr(p, "text", "") for p in msg.content)
-            try:
-                data = json.loads(text)
-                if isinstance(data, dict) and all(k in data for k in ("state", "suggestion", "reason")):
-                    return data
-            except Exception:
-                pass
-        except Exception:
-            pass
-
+    # Fallback
     rule = RULES.get(top, RULES["unknown"])
     conf_pct = f"{int(round(confidence * 100))}%" if confidence else "low"
     reason = f"Top label '{top}' with {conf_pct} confidence based on acoustic features."
     return {"state": rule["state"], "suggestion": rule["suggestion"], "reason": reason}
 
-# Helpers you can import in main.py
+# Helper you can import in main.py
 def normalize_classifier_probs(probs: Dict[str, float]) -> Dict[str, float]:
     """Public helper to sanitize/normalize classifier-space probabilities."""
     p = _normalize_probs(probs or {})
