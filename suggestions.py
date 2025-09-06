@@ -1,209 +1,156 @@
 # suggestions.py
 from __future__ import annotations
 import os, json
-from typing import Dict, List, Optional, TypedDict
+from typing import Dict, Iterable, List, Optional
 
-# ===== Static fallbacks (used ONLY if the API fails) =====
-SUGGESTIONS: Dict[str, str] = {
-    "playful":  "Play tug or fetch for 5–10 minutes. Offer a toy.",
-    "anxious":  "Create distance from the trigger and use a calm cue. Exercise your dog",
-    "aggressive": "Do NOT approach. Remove stimuli; consider a trainer.",
-    "bored":    "Try a snuffle mat or 10-minute puzzle feeder.",
-    "unknown":  "Re-record in a quieter room for 3–5 seconds."
+# Classifier label set (no remapping)
+CLASSIFIER_LABELS = {"joy", "boredom", "hunger", "aggressivity", "sadness"}
+
+# Safety-first, concise guidance per classifier label
+RULES: Dict[str, Dict[str, str]] = {
+    "joy": {
+        "state": "The vocalization suggests a joyful, playful mood.",
+        "suggestion": "Offer a quick play session or toy to positively channel the energy.",
+    },
+    "boredom": {
+        "state": "The vocalization suggests boredom or under-stimulation.",
+        "suggestion": "Provide enrichment: puzzle feeder, snuffle mat, or a short training game.",
+    },
+    "hunger": {
+        "state": "The vocalization may indicate hunger or food expectation.",
+        "suggestion": "Check feeding schedule and portions; avoid reinforcing demand barking; consult a vet if persistent.",
+    },
+    "aggressivity": {
+        "state": "The vocalization suggests increased reactivity or aggressivity.",
+        "suggestion": "Do not approach; reduce triggers and give space. Seek a qualified trainer if it persists.",
+    },
+    "sadness": {
+        "state": "The vocalization may reflect sadness or low arousal.",
+        "suggestion": "Offer calm reassurance and gentle engagement; monitor context and consult a vet if ongoing.",
+    },
+    "unknown": {
+        "state": "The signal is unclear.",
+        "suggestion": "Try another recording in a quieter environment, slightly closer but non-intrusive.",
+    },
 }
-CLASSES: List[str] = ["playful", "anxious", "aggressive", "bored", "unknown"]
 
-class ClassScore(TypedDict):
-    label: str
-    score: float  # 0..1
+# ----------------- utils -----------------
 
-class SuggestionJSON(TypedDict):
-    state: str
-    suggestion: str
-    reason: str
+def _normalize_probs(raw: Dict[str, float]) -> Dict[str, float]:
+    """Return finite probs that sum to 1 (best effort)."""
+    if not raw:
+        return {}
+    clean: Dict[str, float] = {}
+    for k, v in raw.items():
+        try:
+            f = float(v)
+            if f != f or f in (float("inf"), float("-inf")):
+                continue
+            clean[str(k).strip().lower()] = f
+        except Exception:
+            continue
+    if not clean:
+        return {}
+    total = sum(clean.values())
+    if total <= 0:
+        n = len(clean)
+        return {k: 1.0 / n for k in clean}
+    return {k: v / total for k, v in clean.items()}
 
-DEBUG = os.getenv("DOGSUGGEST_DEBUG", "0") == "1"
+def _scores_to_dict(scores: Iterable[Dict[str, float]]) -> Dict[str, float]:
+    d: Dict[str, float] = {}
+    for s in scores or []:
+        lbl = str(s.get("label", "unknown")).strip().lower()
+        val = float(s.get("score", 0.0))
+        d[lbl] = d.get(lbl, 0.0) + val
+    return d
 
-# You can force a model via env: DOGSUGGEST_MODEL="claude-3-5-haiku-latest"
-ENV_MODEL = os.getenv("DOGSUGGEST_MODEL")
-MODEL_CANDIDATES: List[str] = [
-    m for m in [
-        ENV_MODEL,
-        "claude-3-5-haiku-latest",
-        "claude-3-haiku-20240307",
-        "claude-3-sonnet-20240229",
-    ] if m
-]
-
-# ⛔️ Ban phrases that echo your baselines
-BANNED_PHRASES = [
-    "Create distance from the trigger",
-    "Offer a toy",
-    "Try a snuffle mat",
-    "puzzle feeder",
-    "Re-record in a quieter room",
-]
-
-SYSTEM_PROMPT = (
-    "You are a canine veterinarian and behavior micro-coach.\n"
-    "Goal: combine multiple emotional labels into ONE plan.\n"
-    "Requirements:\n"
-    "Write a plain-English STATE describing the overall mood, explicitly naming the top 1–2 emotions (e.g., 'mixed playfulness and anxiety').\n"
-    "Write ONE SUGGESTION that is a composite action plan that addresses each prominent emotion, with 2–3 short clauses separated by commas or semicolons.\n"
-    "  – Include one immediate regulation step (distance/downshift/soothing), AND one engagement/enrichment step (play, sniff, chew, scatter feed).\n"
-    "  – Tailor to provided context (location, trigger, time limits).\n"
-    "  - Suggestions should draw from safe, realistic dog enrichment strategies such as walks, sniffing games, chew toys, puzzle feeders, hide-and-seek, or short training exercises, and must avoid impossible or human-only activities (e.g. breathing, reading). If there is a dog product that could help, please recommend it (specific sprays, chews, etc.)"
-    "Write a short REASON explaining how the plan helps both emotions.\n"
-    "Hard rules:\n"
-    "• Do NOT copy or paraphrase any default baseline text; avoid these phrases entirely: "
-    + "; ".join(f"'{p}'" for p in BANNED_PHRASES) + ".\n"
-    "• Avoid generic fluff. Be specific and safe. For 'aggressive', prioritize safety then professional help if it persists.\n"
-    'Output STRICT JSON only as: {"state":"string","suggestion":"string","reason":"string"}'
-)
-
-# ===== Anthropic client =====
-# pip install anthropic
-# export ANTHROPIC_API_KEY=sk-ant-...
-from anthropic import Anthropic
-from anthropic import NotFoundError, PermissionDeniedError, RateLimitError
-_client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-
-def _build_user_prompt(
-    top_label: str,
-    scores: Optional[List[ClassScore]] = None,
-    context: Optional[str] = None,
-) -> str:
-    """
-    Intentionally omits baseline texts to avoid anchoring/copying.
-    Provides ranked labels + context and asks for a composite plan.
-    """
-    payload = {
-        "top_label": top_label,
-        "scores": scores,          # e.g. [{"label":"anxious","score":0.41}, ...]
-        "user_context": context,   # free text, optional
-        "style_guidance": {
-            "structure": "state + single composite suggestion + reason",
-            "lengths": {"suggestion_words_max": 25, "reason_words_max": 20},
-            "include_emotions": "explicitly name top 1–2 emotions in 'state'",
-            "cover_each_emotion": True
-        }
-    }
-    return "Classifier result and context:\n" + json.dumps(payload, ensure_ascii=False)
-
-def _claude_json(
-    model: str,
-    system_prompt: str,
-    user_prompt: str,
-    temperature: float,
-    top_p: float,
-    timeout_seconds: float,
-) -> dict:
-    resp = _client.messages.create(
-        model=model,
-        max_tokens=220,
-        temperature=temperature,  # encourage creativity
-        top_p=top_p,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
-        timeout=timeout_seconds,
+def _sorted_scores_from_probs(probs: Dict[str, float]) -> List[Dict[str, float]]:
+    return sorted(
+        ({"label": k, "score": float(v)} for k, v in probs.items()),
+        key=lambda x: x["score"],
+        reverse=True,
     )
-    text = resp.content[0].text if resp.content else ""
-    if DEBUG:
-        print(f"[dogsuggest] model={model} raw_text:", repr(text))
-    return json.loads(text)
 
-def _fallback_json(top_label: str) -> SuggestionJSON:
-    base = SUGGESTIONS.get(top_label, SUGGESTIONS["unknown"])
-    label_nice = top_label if top_label in SUGGESTIONS else "unknown"
-    return {
-        "state": f"Your dog likely shows primarily {label_nice} behavior.",
-        "suggestion": base,
-        "reason": "Using baseline guidance due to model error."
-    }
+# ----------------- public API -----------------
 
 def llm_suggestion(
-    top_label: str,
-    scores: Optional[List[ClassScore]] = None,
-    context: Optional[str] = None,
     *,
-    temperature: float = 0.6,       # ↑ a bit for more variety
-    top_p: float = 0.9,             # sample more creatively but safely
-    timeout_seconds: float = 8.0,
-    system_prompt: Optional[str] = None,
-) -> SuggestionJSON:
+    top_label: str,
+    scores: Optional[Iterable[Dict[str, float]]] = None,
+    context: Optional[str] = None,
+    # kept for API compatibility; when True we still treat labels as classifier labels
+    classifier_space: bool = True,
+) -> Dict[str, str]:
     """
-    Returns {"state","suggestion","reason"} from Anthropic Claude.
-    Uses creative sampling and forbids baseline regurgitation.
+    Build concise user-facing guidance in *classifier label space*.
+    Returns: {"state": str, "suggestion": str, "reason": str}
     """
-    if top_label not in SUGGESTIONS:
-        top_label = "unknown"
+    top = str(top_label).strip().lower()
+    if top not in CLASSIFIER_LABELS:
+        top = "unknown"
 
-    user_prompt = _build_user_prompt(top_label, scores, context)
-    sys_prompt = system_prompt or SYSTEM_PROMPT
+    probs = {}
+    if scores:
+        probs = _normalize_probs(_scores_to_dict(scores))
+        # Drop any non-classifier keys
+        probs = {k: v for k, v in probs.items() if k in CLASSIFIER_LABELS}
+        probs = _normalize_probs(probs)
+    confidence = float(probs.get(top, 0.0)) if probs else 0.0
 
-    last_error: Optional[Exception] = None
-    for model in MODEL_CANDIDATES:
+    # Optional Anthropic path; graceful fallback to RULES on any issue
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if api_key:
         try:
-            data = _claude_json(model, sys_prompt, user_prompt, temperature, top_p, timeout_seconds)
+            from anthropic import Anthropic
+            client = Anthropic(api_key=api_key)
 
-            # --- strict parse & normalization ---
-            state = (data.get("state") or "").strip()
-            suggestion = (data.get("suggestion") or "").strip()
-            reason = (data.get("reason") or "").strip()
+            label_doc = (
+                "- joy: positive/playful arousal\n"
+                "- boredom: under-stimulation\n"
+                "- hunger: food expectation/need\n"
+                "- aggressivity: reactivity/guarding risk\n"
+                "- sadness: low arousal/whine\n"
+            )
+            system = (
+                "You assist a dog-bark classifier. Respond with compact JSON keys "
+                "{state, suggestion, reason}. One sentence each. Safety-first tone."
+            )
+            user = (
+                f"Context: {context or 'N/A'}\n"
+                f"Top label (classifier space): {top}\n"
+                f"Label probabilities (classifier space): "
+                f"{json.dumps(probs or {}, separators=(',',':'))}\n\n"
+                f"Label doc:\n{label_doc}\n\n"
+                "Return ONLY JSON with keys exactly: state, suggestion, reason."
+            )
+            msg = client.messages.create(
+                model=os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest"),
+                max_tokens=200,
+                temperature=0.2,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            )
+            text = "".join(getattr(p, "text", "") for p in msg.content)
+            try:
+                data = json.loads(text)
+                if isinstance(data, dict) and all(k in data for k in ("state", "suggestion", "reason")):
+                    return data
+            except Exception:
+                pass
+        except Exception:
+            pass
 
-            if not state or not suggestion:
-                raise ValueError("Missing 'state' or 'suggestion' in JSON")
+    rule = RULES.get(top, RULES["unknown"])
+    conf_pct = f"{int(round(confidence * 100))}%" if confidence else "low"
+    reason = f"Top label '{top}' with {conf_pct} confidence based on acoustic features."
+    return {"state": rule["state"], "suggestion": rule["suggestion"], "reason": reason}
 
-            # Soft guard: discourage banned baseline phrasing
-            lower = suggestion.lower()
-            if any(p.lower() in lower for p in BANNED_PHRASES):
-                raise ValueError("Suggestion resembled a banned baseline phrase")
+# Helpers you can import in main.py
+def normalize_classifier_probs(probs: Dict[str, float]) -> Dict[str, float]:
+    """Public helper to sanitize/normalize classifier-space probabilities."""
+    p = _normalize_probs(probs or {})
+    p = {k: v for k, v in p.items() if k in CLASSIFIER_LABELS}
+    return _normalize_probs(p)
 
-            return {"state": state, "suggestion": suggestion, "reason": reason}
-
-        except NotFoundError as e:
-            last_error = e
-            if DEBUG:
-                print(f"[dogsuggest] Model not found, trying next: {model} -> {repr(e)}")
-            continue
-        except PermissionDeniedError as e:
-            last_error = e
-            if DEBUG:
-                print(f"[dogsuggest] Permission denied for model {model}: {repr(e)}")
-            continue
-        except RateLimitError as e:
-            last_error = e
-            if DEBUG:
-                print(f"[dogsuggest] Rate limited on model {model}: {repr(e)}")
-            break
-        except Exception as e:
-            last_error = e
-            if DEBUG:
-                import traceback
-                print(f"[dogsuggest] Error with model {model}: {repr(e)}")
-                traceback.print_exc()
-            # Try next candidate only for model-not-found/permission; otherwise break
-            break
-
-    if DEBUG and last_error:
-        print("[dogsuggest] Falling back to baseline JSON due to:", repr(last_error))
-    return _fallback_json(top_label)
-
-def suggestion_for_label(label: str) -> SuggestionJSON:
-    return llm_suggestion(top_label=label)
-
-# ===== CLI quick test =====
-if __name__ == "__main__":
-    ranked = [
-        {"label": "anxious", "score": 0.41},
-        {"label": "bored", "score": 0.37},
-        {"label": "unknown", "score": 0.12},
-    ]
-    result = llm_suggestion(
-        top_label="anxious",
-        scores=ranked,
-        context="Whining at the window after a loud truck passed; owner has 5 minutes.",
-        temperature=0.65,
-        top_p=0.9,
-    )
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+__all__ = ["llm_suggestion", "normalize_classifier_probs", "CLASSIFIER_LABELS"]
