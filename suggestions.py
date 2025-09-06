@@ -136,7 +136,7 @@ def _try_llm(top: str, probs: Dict[str, float], context: Optional[str]) -> Optio
         "Avoid recommendations that only humans can do (e.g. taking deep breaths, journaling reading)"
         "Target approaches that focus on humans helping out. For example, if a dog is anxious, you may expect taking them on a walk."
         "Include product recommendations when relevant. You may recommend Kong peanut butter toys for example or certain teeth cleaning chews."
-        "Respond ONLY as JSON with keys {state, suggestion, reason}. "
+        "Respond ONLY as JSON with keys {state, suggestion, products, reason}. "
     )
 
     user = (
