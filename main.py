@@ -1,84 +1,93 @@
-# main.py
+# main.py — classifier labels end-to-end
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, Optional, List
 import os, uuid, tempfile, subprocess
 
-# local modules
-import classifier  # import the module, not the symbol
-from suggestions import llm_suggestion  # ⬅️ use the LLM, not the static table
+from snoutscout_classifier import dog_bark_classifier as clf
+from suggestions import llm_suggestion, normalize_classifier_probs, CLASSIFIER_LABELS
+
+print("🐶 Using classifier file:", clf.__file__)
+import suggestions as _sug
+print("🧠 Using suggestions file:", _sug.__file__)
 
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".webm"}
+app = FastAPI(title="DogMood API", version="0.2.0")
 
-app = FastAPI(title="DogMood API", version="0.1.0")
-
-# --- API models ---
 class AnalysisResult(BaseModel):
-    # classifier results
-    label: str
+    label: str                                 # joy/boredom/hunger/aggressivity/sadness
     confidence: float
-    probs: Optional[Dict[str, float]] = None
-
-    # LLM merged, user-facing explanation
+    probs: Optional[Dict[str, float]] = None   # classifier-space probs
     state: str
     suggestion: str
     reason: str
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": "0.1.0"}
+    return {"ok": True, "version": app.version}
 
 @app.post("/analyze", response_model=AnalysisResult)
 async def analyze(file: UploadFile = File(...)):
-    # 1) save upload to a temp file
+    # 1) save upload
     name = file.filename or "upload.bin"
     _, ext = os.path.splitext(name.lower())
     tmp_in = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}{ext or '.bin'}")
     with open(tmp_in, "wb") as f:
         f.write(await file.read())
 
-    # 2) if video, try to extract mono 16k audio (ok if ffmpeg missing)
-    audio_path = tmp_in
-    if ext in VIDEO_EXTS:
+    # 2) force mono 16k WAV
+    def _to_wav16k(src: str) -> str:
         out = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.wav")
         try:
-            subprocess.run(["ffmpeg", "-y", "-i", tmp_in, "-ac", "1", "-ar", "16000", out], check=True)
-            audio_path = out
+            subprocess.run(["ffmpeg", "-y", "-i", src, "-ac", "1", "-ar", "16000", out], check=True)
+            return out
         except Exception:
-            audio_path = tmp_in
+            return src
 
-    # 3) run your classifier
-    result = classifier.classify_bark(audio_path)  # expected: {"label": "...", "confidence": 0.xx, "probs": {...}}
-    label = str(result.get("label", "unknown"))
-    confidence = float(result.get("confidence", 0.0))
-    probs: Dict[str, float] = result.get("probs") or {}
+    audio_path = tmp_in
+    if ext in VIDEO_EXTS or ext != ".wav":
+        audio_path = _to_wav16k(tmp_in)
 
-    # convert probs -> ranked scores list for the LLM (highest first)
+    # 3) run classifier (classifier-space outputs)
+    train_dir = os.path.dirname(os.path.abspath(clf.__file__))
+    res = clf.classify_clip(audio_path, train_dir=train_dir, k=5)
+
+    raw_label = str(res.get("prediction_label", "unknown")).strip().lower()
+    raw_probs: Dict[str, float] = res.get("average_class_probabilities") or {}
+
+    # 4) normalize & clamp to classifier label set
+    probs = normalize_classifier_probs(raw_probs)
+    if raw_label not in CLASSIFIER_LABELS:
+        raw_label = max(probs, key=probs.get, default="unknown")
+
+    confidence = float(probs.get(raw_label, 0.0))
+
+    # 5) build scores in classifier space for suggester
     scores: List[dict] = sorted(
         ({"label": k, "score": float(v)} for k, v in probs.items()),
         key=lambda x: x["score"],
         reverse=True,
     ) if probs else []
 
-    # 4) build a tiny context (tweak as you like)
-    context = f"Uploaded file: {name}"
-
-    # 5) ask the LLM for the merged state/suggestion/reason
+    # 6) generate user-facing text (already in classifier space)
     merged = llm_suggestion(
-        top_label=label,
+        top_label=raw_label,
         scores=scores or None,
-        context=context,
+        context=f"Uploaded file: {name}",
+        classifier_space=True,  # labels are already classifier labels
     )
-    # merged is: {"state": str, "suggestion": str, "reason": str}
 
     return AnalysisResult(
-        label=label,
+        label=raw_label,
         confidence=confidence,
         probs=probs or None,
         state=merged["state"],

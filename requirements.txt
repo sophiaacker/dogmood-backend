@@ -1,5 +1,6 @@
 fastapi
 uvicorn[standard]
 python-multipart
+numpy
 python-dotenv
-anthropic
+anthropic      # only if you’ll use the LLM live
