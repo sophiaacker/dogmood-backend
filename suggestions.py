@@ -52,7 +52,7 @@ SYSTEM_PROMPT = (
     "Write ONE SUGGESTION that is a composite action plan that addresses each prominent emotion, with 2–3 short clauses separated by commas or semicolons.\n"
     "  – Include one immediate regulation step (distance/downshift/soothing), AND one engagement/enrichment step (play, sniff, chew, scatter feed).\n"
     "  – Tailor to provided context (location, trigger, time limits).\n"
-    "  - Suggestions should draw from safe, realistic dog enrichment strategies such as walks, sniffing games, chew toys, puzzle feeders, hide-and-seek, or short training exercises, and must avoid impossible or human-only activities (e.g. breathing, reading)."
+    "  - Suggestions should draw from safe, realistic dog enrichment strategies such as walks, sniffing games, chew toys, puzzle feeders, hide-and-seek, or short training exercises, and must avoid impossible or human-only activities (e.g. breathing, reading). If there is a dog product that could help, please recommend it (specific sprays, chews, etc.)"
     "Write a short REASON explaining how the plan helps both emotions.\n"
     "Hard rules:\n"
     "• Do NOT copy or paraphrase any default baseline text; avoid these phrases entirely: "
