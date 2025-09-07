@@ -21,6 +21,7 @@ class AnalysisResult(BaseModel):
     probs: Optional[Dict[str, float]] = None   # classifier-space probs
     state: str
     suggestion: str
+    products: Optional[List[str]] = None       # product recommendations
     reason: str
 
 app.add_middleware(
@@ -92,5 +93,6 @@ async def analyze(file: UploadFile = File(...)):
         probs=probs or None,
         state=merged["state"],
         suggestion=merged["suggestion"],
+        products=merged.get("products"),
         reason=merged["reason"],
     )

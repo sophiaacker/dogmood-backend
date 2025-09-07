@@ -9,6 +9,9 @@ def _dbg(*a):
     if DEBUG:
         print("[SUGGESTIONS]", *a)
 
+# Debug marker to verify code changes are being picked up (remove this in production)
+print("🔄 SUGGESTIONS MODULE LOADED - Changes should be visible now!")
+
 # Try to load .env locally so you don't forget to export vars during dev
 try:
     from dotenv import load_dotenv  # optional; if not installed it's fine
@@ -135,8 +138,7 @@ def _try_llm(top: str, probs: Dict[str, float], context: Optional[str]) -> Optio
         "Focus on the moods with the highest levels of expression. Based on the breakdown of moods the dog is experiencing, recommend actionable items that a dog owner can do to help with the current mood. "
         "Avoid recommendations that only humans can do (e.g. taking deep breaths, journaling reading)"
         "Target approaches that focus on humans helping out. For example, if a dog is anxious, you may expect taking them on a walk."
-        "Include product recommendations when relevant. You may recommend Kong peanut butter toys for example or certain teeth cleaning chews."
-        "Respond ONLY as JSON with keys {state, suggestion, products, reason}. "
+        "Respond ONLY as JSON with keys {state: mood, suggestion: actionable item, products: ['product1', 'product2', 'product3'], reason: rationale}. "
         "The products key should have an array value. (for example, ['Chewies', 'Kong Rope Toy', 'Greenies'])"
     )
 
@@ -145,7 +147,7 @@ def _try_llm(top: str, probs: Dict[str, float], context: Optional[str]) -> Optio
         f"Top label (classifier space): {top}\n"
         f"Label probabilities (classifier space): {json.dumps(probs or {}, separators=(',',':'))}\n\n"
         f"Label guide:\n{label_doc}\n\n"
-        "Return ONLY JSON with keys exactly: state, suggestion, reason."
+        "Return ONLY JSON with keys exactly: state, suggestion, products, reason."
     )
 
     try:
@@ -189,7 +191,7 @@ def _try_llm(top: str, probs: Dict[str, float], context: Optional[str]) -> Optio
             except Exception as e:
                 _dbg("json.loads brace-scan failed:", repr(e))
 
-    if isinstance(data, dict) and all(k in data for k in ("state", "suggestion", "reason")):
+    if isinstance(data, dict) and all(k in data for k in ("state", "suggestion", "products", "reason")):
         _dbg("LLM JSON accepted.")
         return data
 
@@ -208,7 +210,7 @@ def llm_suggestion(
 ) -> Dict[str, str]:
     """
     Build concise user-facing guidance in *classifier label space*.
-    Returns: {"state": str, "suggestion": str, "reason": str}
+    Returns: {"state": str, "suggestion": str "products": arr, "reason": str}
     """
     top = str(top_label).strip().lower()
     probs: Dict[str, float] = {}
