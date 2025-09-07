@@ -118,7 +118,7 @@ def _try_llm(top: str, probs: Dict[str, float], context: Optional[str]) -> Optio
     Includes robust JSON extraction and debug logs.
     """
     # Hardcoded API key for hackathon demo
-    api_key = "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"
+    api_key = "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"
     
     # Fallback to environment variable if hardcoded key doesn't work
     if not api_key:
