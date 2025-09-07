@@ -117,7 +117,12 @@ def _try_llm(top: str, probs: Dict[str, float], context: Optional[str]) -> Optio
     Attempt an Anthropic call. Return dict({state,suggestion,reason}) or None on any issue.
     Includes robust JSON extraction and debug logs.
     """
-    api_key = os.getenv("ANTHROPIC_API_KEY")
+    # Hardcoded API key for hackathon demo
+    api_key = "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"
+    
+    # Fallback to environment variable if hardcoded key doesn't work
+    if not api_key:
+        api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         _dbg("ANTHROPIC_API_KEY not set; using RULES fallback.")
         return None
