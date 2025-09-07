@@ -22,9 +22,12 @@ except Exception:
 # ----------------- label space -------------------
 # We stay in *classifier* label space end-to-end.
 CLASSIFIER_LABELS = {"joy", "boredom", "hunger", "aggressivity", "sadness"}
+SKIN_LABELS = {"ear", "atopic", "acute", "lick"}
+ALL_LABELS = CLASSIFIER_LABELS | SKIN_LABELS
 
 # Safety-first, concise rule fallback per classifier label
 RULES: Dict[str, Dict[str, str]] = {
+    # Bark analysis labels
     "joy": {
         "state": "The vocalization suggests a joyful, playful mood.",
         "suggestion": "Offer a quick play session or toy to positively channel the energy.",
@@ -44,6 +47,23 @@ RULES: Dict[str, Dict[str, str]] = {
     "sadness": {
         "state": "The vocalization may reflect sadness or low arousal.",
         "suggestion": "Offer calm reassurance and gentle engagement; monitor context and consult a vet if ongoing.",
+    },
+    # Skin condition labels
+    "ear": {
+        "state": "The image shows signs of ear-related skin condition.",
+        "suggestion": "Clean ears gently with vet-approved solution; avoid cotton swabs. Schedule vet visit if persistent or worsening.",
+    },
+    "atopic": {
+        "state": "The image suggests atopic dermatitis (allergic skin condition).",
+        "suggestion": "Identify and avoid allergens; use hypoallergenic products. Consult vet for antihistamines or specialized treatment.",
+    },
+    "acute": {
+        "state": "The image shows acute moist dermatitis (hot spot).",
+        "suggestion": "Keep area clean and dry; prevent licking/scratching with cone if needed. See vet promptly for treatment.",
+    },
+    "lick": {
+        "state": "The image indicates lick dermatitis from excessive licking.",
+        "suggestion": "Address underlying cause (boredom, anxiety, pain); provide mental stimulation. Vet consultation recommended.",
     },
     "unknown": {
         "state": "The signal is unclear.",
@@ -123,37 +143,70 @@ def _try_llm(top: str, probs: Dict[str, float], context: Optional[str]) -> Optio
     # Note: older anthropic SDKs may not support .with_options; we'll rely on default timeout behavior.
     _dbg("LLM model:", model, "temp:", temperature, "timeout:", timeout)
 
-    label_doc = (
-        "- joy: positive/playful arousal\n"
-        "- boredom: under-stimulation\n"
-        "- hunger: food expectation/need\n"
-        "- aggressivity: reactivity/guarding risk\n"
-        "- sadness: low arousal/whine\n"
-    )
+    # Determine if this is bark or skin analysis based on the label
+    is_skin_analysis = top in SKIN_LABELS
+    
+    if is_skin_analysis:
+        label_doc = (
+            "- ear: ear-related skin condition/infection\n"
+            "- atopic: atopic dermatitis (allergic skin condition)\n"
+            "- acute: acute moist dermatitis (hot spot)\n"
+            "- lick: lick dermatitis from excessive licking\n"
+        )
+        analysis_type = "skin condition"
+    else:
+        label_doc = (
+            "- joy: positive/playful arousal\n"
+            "- boredom: under-stimulation\n"
+            "- hunger: food expectation/need\n"
+            "- aggressivity: reactivity/guarding risk\n"
+            "- sadness: low arousal/whine\n"
+        )
+        analysis_type = "bark"
 
     # FIXED: the original prompt had adjacent strings without spaces → merged words → worse parsing.
-    system = (
-        "You are dog behavior analyst and veterinarian "
-        "Given classifier results from a bark, analyze the dog's moods. "
-        "Focus on the moods with the highest levels of expression. Based on the breakdown of moods the dog is experiencing, recommend actionable items that a dog owner can do to help with the current mood. "
-        "Avoid recommendations that only humans can do (e.g. taking deep breaths, journaling reading)"
-        "Target approaches that focus on humans helping out. For example, if a dog is anxious, you may expect taking them on a walk."
-        "Respond ONLY as JSON with keys {state: mood, suggestion: actionable item, products: ['product1', 'product2', 'product3'], reason: rationale}. "
-        "The products key should have an array value. (for example, ['Chewies', 'Kong Rope Toy', 'Greenies'])"
-    )
+    if is_skin_analysis:
+        system = (
+            "You are a veterinary dermatologist. Analyze the dog skin condition from classifier results. "
+            "Provide concise, actionable care recommendations for dog owners. "
+            "Emphasize when to see a vet, especially in situations that seem acute. Avoid prescription medications. "
+            "Respond ONLY as JSON: {\"state\": \"brief condition name\", \"suggestion\": \"concise care steps\", \"products\": [\"product1\", \"product2\", \"product3\"], \"reason\": \"brief medical rationale\"}. "
+            "Keep all fields concise. Products should be specific care items like 'Medicated Shampoo', 'E-Collar', 'Antiseptic Wipes'."
+        )
+    else:
+        system = (
+            "You are dog behavior analyst and veterinarian "
+            f"Given classifier results from a {analysis_type}, analyze the dog's moods. "
+            "Focus on the moods with the highest levels of expression. Based on the breakdown of moods the dog is experiencing, recommend actionable items that a dog owner can do to help with the current mood. "
+            "Avoid recommendations that only humans can do (e.g. taking deep breaths, journaling reading)"
+            "Target approaches that focus on humans helping out. For example, if a dog is anxious, you may expect taking them on a walk."
+            "Respond ONLY as JSON with keys {state: mood, suggestion: actionable item, products: ['product1', 'product2', 'product3'], reason: rationale}. "
+            "The products key should have an array value. (for example, ['Chewies', 'Kong Rope Toy', 'Greenies'])"
+        )
 
-    user = (
-        f"Context: {context or 'N/A'}\n"
-        f"Top label (classifier space): {top}\n"
-        f"Label probabilities (classifier space): {json.dumps(probs or {}, separators=(',',':'))}\n\n"
-        f"Label guide:\n{label_doc}\n\n"
-        "Return ONLY JSON with keys exactly: state, suggestion, products, reason."
-    )
+    if is_skin_analysis:
+        user = (
+            f"Skin condition detected: {top} (confidence: {probs.get(top, 0):.1%})\n"
+            f"All probabilities: {json.dumps(probs or {}, separators=(',',':'))}\n\n"
+            f"Condition guide:\n{label_doc}\n"
+            "Return concise JSON with keys: state, suggestion, products, reason."
+        )
+    else:
+        user = (
+            f"Context: {context or 'N/A'}\n"
+            f"Top mood: {top} (confidence: {probs.get(top, 0):.1%})\n"
+            f"All probabilities: {json.dumps(probs or {}, separators=(',',':'))}\n\n"
+            f"Mood guide:\n{label_doc}\n"
+            "Return JSON with keys: state, suggestion, products, reason."
+        )
 
+    # Use more tokens for skin analysis due to medical terminology
+    max_tokens = 300 if is_skin_analysis else 200
+    
     try:
         msg = client.messages.create(
             model=model,
-            max_tokens=200,
+            max_tokens=max_tokens,
             temperature=temperature,
             system=system,
             messages=[{"role": "user", "content": user}],
@@ -217,11 +270,11 @@ def llm_suggestion(
 
     if scores:
         probs = _normalize_probs(_scores_to_dict(scores))
-        # Keep only known classifier labels
-        probs = {k: v for k, v in probs.items() if k in CLASSIFIER_LABELS}
+        # Keep only known labels (bark or skin)
+        probs = {k: v for k, v in probs.items() if k in ALL_LABELS}
         probs = _normalize_probs(probs)
 
-    if top not in CLASSIFIER_LABELS:
+    if top not in ALL_LABELS:
         # If we got an unknown top but we have probabilities, pick the argmax;
         # otherwise, mark as unknown.
         top = max(probs, key=probs.get) if probs else "unknown"
@@ -246,4 +299,4 @@ def normalize_classifier_probs(probs: Dict[str, float]) -> Dict[str, float]:
     p = {k: v for k, v in p.items() if k in CLASSIFIER_LABELS}
     return _normalize_probs(p)
 
-__all__ = ["llm_suggestion", "normalize_classifier_probs", "CLASSIFIER_LABELS"]
+__all__ = ["llm_suggestion", "normalize_classifier_probs", "CLASSIFIER_LABELS", "SKIN_LABELS", "ALL_LABELS"]
